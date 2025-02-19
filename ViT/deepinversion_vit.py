@@ -66,12 +66,19 @@ class DeepInversionFeatureHook:
 
         elif self.model_type == "vit":
             # ViT feature regularization (mean & variance over token embeddings)
-            embeddings = output  # Shape: (B, num_tokens, D)
+            if isinstance(output, tuple):
+                embeddings = output[
+                    0
+                ]  # Attention output is typically the first element
+            else:
+                embeddings = (
+                    output  # If not a tuple, the output itself is the embeddings
+                )
             mean = embeddings.mean(dim=[0, 1])  # Mean over batch & tokens
             var = embeddings.var(
                 dim=[0, 1], unbiased=False
-            )  # Variance over batch & tokens
-            self.r_feature = torch.norm(mean, 2) + torch.norm(var, 2)
+            )  # Variance over batch & tokensx
+            self.r_feature = (mean, var)
 
     def close(self):
         self.hook.remove()
@@ -82,9 +89,11 @@ def get_kl_loss(loss_r_feature_layers_verifier):
     Computes KL divergence loss between feature statistics from CNN BatchNorm layers
     and generated noise statistics.
     """
-    loss_kl = 0
+    total_kl_loss = 0
     eps = 1e-6  # Small value for numerical stability
 
+    # Calculate KL divergence between input and statistics of each BatchNorm layer
+    kl_losses = []
     for hook in loss_r_feature_layers_verifier:
         mean_gen, var_gen, mean_bn, var_bn = hook.r_feature
 
@@ -92,19 +101,19 @@ def get_kl_loss(loss_r_feature_layers_verifier):
         var_gen = torch.clamp(var_gen, min=eps)
         var_bn = torch.clamp(var_bn, min=eps)
 
-        # Compute KL divergence
+        # Compute KL divergence per feature map
         kl_loss = 0.5 * (
-            (var_gen / var_bn)
-            + ((mean_bn - mean_gen) ** 2) / var_bn
+            torch.log(var_bn / var_gen)
+            + ((var_gen + (mean_bn - mean_gen) ** 2) / var_bn)
             - 1
-            + torch.log(var_bn / var_gen)
         )
 
-        loss_kl += kl_loss.sum()  # Summing over channels
+        # Store per-layer loss
+        kl_losses.append(kl_loss.mean())  # Average per feature map
 
-    return loss_kl / len(
-        loss_r_feature_layers_verifier
-    )  # Normalize by the number of layers
+    # Aggregate loss across layers
+    normalized_kl_loss = torch.stack(kl_losses).mean() if kl_losses else 0
+    return normalized_kl_loss
 
 
 def get_image_prior_losses(inputs_jit):
@@ -127,14 +136,24 @@ def get_image_prior_losses(inputs_jit):
     return loss_var_l1, loss_var_l2
 
 
+def compute_r_feature_scalar(r_feature):
+    """
+    Given r_feature as a tuple (mean, var) from a ViT layer,
+    return a scalar value that represents the difference in statistics.
+    Here we simply combine the L2 norms of the mean and variance.
+    """
+    mean, var = r_feature
+    return torch.norm(mean, 2) + torch.norm(var, 2)
+
+
 class ViTDeepInversionClass(object):
     def __init__(
         self,
         bs=84,
         use_fp16=True,
-        net_teacher=None,
-        net_verifier=None,
-        path="./generations/",
+        vit_teacher=None,
+        net_guide=None,
+        store_dir="./generations/",
         parameters=dict(),
         setting_id=0,
         jitter=30,
@@ -146,9 +165,9 @@ class ViTDeepInversionClass(object):
         """
         :param bs: batch size per GPU for image generation
         :param use_fp16: use FP16 (or APEX AMP) for model inversion, uses less memory and is faster for GPUs with Tensor Cores
-        :parameter net_teacher: Pytorch model to be inverted
-        :param path: path where to write temporal images and data
-        :param final_data_path: path to write final images into
+        :parameter vit_teacher: Pytorch model to be inverted
+        :parameter net_guide: Pytorch model to guide the inversion. E.g. a ResNet model
+        :param store_dir: path where to write temporal images and data
         :param parameters: a dictionary of control parameters:
             "resolution": input image resolution, single value, assumed to be a square, 224
             "random_label" : for classification initialize target to be random values
@@ -157,27 +176,27 @@ class ViTDeepInversionClass(object):
             0 - will run low resolution optimization for 1k and then full resolution for 1k;
             1 - will run optimization on high resolution for 2k
             2 - will run optimization on high resolution for 20k
-
+        :param criterion: loss function to be used for optimization, e.g. nn.CrossEntropyLoss()
         :param jitter: amount of random shift applied to image at every iteration
         :param coefficients: dictionary with parameters and coefficients for optimization.
             keys:
+            "lr" - learning rate for optimization
             "r_feature" - coefficient for feature distribution regularization
             "tv_l1" - coefficient for total variation L1 loss
             "tv_l2" - coefficient for total variation L2 loss
             "l2" - l2 penalization weight
-            "lr" - learning rate for optimization
-            "main_loss_multiplier" - coefficient for the main loss optimization
+            "main_loss_scale" - coefficient for the main loss optimization
             "kl_loss_scale" - coefficient for Adaptive DeepInversion, competition, def =0 means no competition
         network_output_function: function to be applied to the output of the network to get the output
         hook_for_display: function to be executed at every print/save call, useful to check accuracy of verifier
         """
 
-        print("Deep inversion class generation")
+        print("ViT Deep inversion class generation")
         # for reproducibility
         torch.manual_seed(torch.cuda.current_device())
 
-        self.net_teacher = net_teacher
-        self.net_verifier = net_verifier
+        self.vit_teacher = vit_teacher
+        self.net_guide = net_guide
 
         if "resolution" in parameters.keys():
             self.image_resolution = parameters["resolution"]
@@ -198,27 +217,28 @@ class ViTDeepInversionClass(object):
         self.hook_for_display = hook_for_display
 
         if "r_feature_scale" in coefficients.keys():
+            self.lr = coefficients["lr"]
             self.ln_reg_scale = coefficients["r_feature_scale"]
             self.first_ln_multiplier = coefficients["first_ln_multiplier"]
             self.var_l1_scale = coefficients["tv_l1_scale"]
             self.var_l2_scale = coefficients["tv_l2_scale"]
             self.l2_scale = coefficients["l2_scale"]
             self.kl_loss_scale = coefficients["kl_loss_scale"]
-            self.lr = coefficients["lr"]
-            self.main_loss_multiplier = coefficients["main_loss_multiplier"]
+            self.main_loss_scale = coefficients["main_loss_scale"]
         else:
             print("Provide a coefficient dictionary")
 
         self.num_generations = 0
 
-        prefix = path
-        self.prefix = prefix
+        self.prefix = store_dir
+        self.generated_images_path = self.prefix + "/best_images/"
+        self.final_images_path = self.prefix + "/final_images/"
 
         local_rank = torch.cuda.current_device()
         if local_rank == 0:
-            create_folder(prefix)
-            create_folder(prefix + "/best_images/")
-            create_folder(prefix + "/final_images/")
+            create_folder(self.prefix)
+            create_folder(self.generated_images_path)
+            create_folder(self.final_images_path)
 
         ## Create hooks for feature statistics
         self.loss_r_feature_layers = []
@@ -226,14 +246,55 @@ class ViTDeepInversionClass(object):
 
         # (ANIMESH) Added support for ViT
         # Adding hooks for feature statistics
-        for module in self.net_teacher.modules():
-            if isinstance(module, nn.LayerNorm):
-                # Hook for ViT LayerNorm layers
+        # for module in self.vit_teacher.modules():
+        #     if isinstance(module, nn.LayerNorm):
+        #         # Hook for ViT LayerNorm layers
+        #         self.loss_r_feature_layers.append(
+        #             DeepInversionFeatureHook(module, model_type="vit")
+        #         )
+
+        for name, module in self.vit_teacher.named_modules():
+            print("\n")
+            print(name)
+            if name == "encoder.ln":  # Final LayerNorm
                 self.loss_r_feature_layers.append(
                     DeepInversionFeatureHook(module, model_type="vit")
                 )
+                print(f"Hook added to Final LayerNorm: {name}")
 
-        for module in self.net_verifier.modules():
+            elif "ln_2" in name and isinstance(
+                module, nn.LayerNorm
+            ):  # Intermediate LayerNorms
+                self.loss_r_feature_layers.append(
+                    DeepInversionFeatureHook(module, model_type="vit")
+                )
+                print(f"Hook added to LayerNorm ln_2: {name}")
+
+            elif (
+                "mlp.0" in name or "mlp.3" in name
+            ):  # Only first & last linear layers in MLP
+                self.loss_r_feature_layers.append(
+                    DeepInversionFeatureHook(module, model_type="vit")
+                )
+                print(f"Hook added to MLP Layer: {name}")
+
+            #             elif (
+            #                 "self_attention.out_proj" not in name and "self_attention" in name
+            #                 # "self_attention.out_proj" in name
+
+            #             ):  # Multi-Head Attention output projection
+            #                 self.loss_r_feature_layers.append(
+            #                     DeepInversionFeatureHook(module, model_type="vit")
+            #                 )
+            #                 print(f"Hook added to Multi-Head Attention Output: {name}")
+
+            elif name == "conv_proj":  # Patch Embedding Layer
+                self.loss_r_feature_layers.append(
+                    DeepInversionFeatureHook(module, model_type="vit")
+                )
+                print(f"Hook added to Patch Embedding Layer: {name}")
+
+        for module in self.net_guide.modules():
             if isinstance(module, nn.BatchNorm2d):
                 # Hook for CNN BatchNorm layers
                 self.loss_r_feature_layers_verifier.append(
@@ -250,8 +311,8 @@ class ViTDeepInversionClass(object):
     def get_images(self, targets=None):
         print("Generating images...")
 
-        net_teacher = self.net_teacher
-        net_verifier = self.net_verifier
+        vit_teacher = self.vit_teacher
+        net_guide = self.net_guide
         use_fp16 = self.use_fp16
         save_every = self.save_every
 
@@ -267,7 +328,7 @@ class ViTDeepInversionClass(object):
                 [random.randint(0, 999) for _ in range(self.bs)]
             ).to("cuda")
             if not self.random_label:
-                # preselected classes, good for ResNet50v1.5
+                # Preselected target labels
                 targets = [
                     153,
                     200,
@@ -284,7 +345,7 @@ class ViTDeepInversionClass(object):
                     256,
                     275,
                     537,
-                    934,  # Hot dog
+                    239,
                 ]
 
                 print("Batch size: ", self.bs)
@@ -373,14 +434,14 @@ class ViTDeepInversionClass(object):
 
                 # forward pass
                 optimizer.zero_grad()
-                net_teacher.zero_grad()
-                net_verifier.zero_grad()
+                vit_teacher.zero_grad()
+                net_guide.zero_grad()
 
                 with torch.autocast(device_type="cuda", dtype=data_type):
-                    outputs = net_teacher(inputs_jit)
+                    outputs = vit_teacher(inputs_jit)
                     # outputs = self.network_output_function(outputs)
 
-                    ver_outputs = net_verifier(inputs_jit)
+                    ver_outputs = net_guide(inputs_jit)
 
                     # R_cross classification loss
                     # (ANIMESH) Loss 1: CCE
@@ -390,13 +451,9 @@ class ViTDeepInversionClass(object):
                     loss_var_l1, loss_var_l2 = get_image_prior_losses(inputs_jit)
 
                     # R_feature loss
-                    # (ANIMESH) Loss 2: Feature distribution regularization
                     # rescale = [self.first_bn_multiplier] + [
                     #     1.0 for _ in range(len(self.loss_r_feature_layers) - 1)
                     # ]
-                    rescale_vit = [self.first_ln_multiplier] + [
-                        1.0 for _ in range(len(self.loss_r_feature_layers) - 1)
-                    ]
                     # loss_r_feature = sum(
                     #     [
                     #         mod.r_feature * rescale[idx]
@@ -404,12 +461,34 @@ class ViTDeepInversionClass(object):
                     #     ]
                     # )
 
+                    # (ANIMESH) Loss 2: Feature distribution regularization for ViT LayerNorm
+                    # rescale_vit = [self.first_ln_multiplier] + [
+                    #     1.0 + (self.first_ln_multiplier / (_s + 2))
+                    #     for _s in range(len(self.loss_r_feature_layers) - 1)
+                    # ]
+
+                    # loss_r_feature = sum(
+                    #     [
+                    #         mod.r_feature * rescale_vit[idx]
+                    #         for (idx, mod) in enumerate(self.loss_r_feature_layers)
+                    #     ]
+                    # ) / len(self.loss_r_feature_layers)
+
+                    ### NEW ####
+                    # Define a weighting for each hook (example using your previous rescale_vit logic)
+                    # For instance, if you have N hooks, you might do:
+                    # rescale_vit = [self.first_ln_multiplier] + [
+                    #     1.0 + (self.first_ln_multiplier / (_s + 2))
+                    #     for _s in range(len(self.loss_r_feature_layers) - 1)
+                    # ]
+
+                    # Compute total r_feature loss by summing weighted loss contributions and averaging:
                     loss_r_feature = sum(
-                        [
-                            mod.r_feature * rescale_vit[idx]
-                            for (idx, mod) in enumerate(self.loss_r_feature_layers)
-                        ]
-                    )
+                        compute_r_feature_scalar(mod.r_feature)  # * rescale_vit[idx]
+                        for idx, mod in enumerate(self.loss_r_feature_layers)
+                    ) / len(self.loss_r_feature_layers)
+
+                    ############
 
                     # KL divergence loss
                     # (ANIMESH) Loss 3: KL divergence loss
@@ -418,7 +497,7 @@ class ViTDeepInversionClass(object):
                     # l2 loss on images
                     loss_l2 = torch.norm(inputs_jit.view(self.bs, -1), dim=1).mean()
 
-                    # combining losses
+                    # Combining regularization losses
                     loss_aux = (
                         self.var_l2_scale * loss_var_l2
                         + self.var_l1_scale * loss_var_l1
@@ -427,7 +506,7 @@ class ViTDeepInversionClass(object):
                         + self.kl_loss_scale * loss_kl
                     )
 
-                    loss = self.main_loss_multiplier * loss_criterion + loss_aux
+                    loss = self.main_loss_scale * loss_criterion + loss_aux
 
                 if local_rank == 0:
                     if iteration % save_every == 0:
@@ -489,11 +568,19 @@ class ViTDeepInversionClass(object):
             if 0:
                 # save into separate folders
                 place_to_store = "{}/s{:03d}/img_{:05d}_id{:03d}_gpu_{}_2.jpg".format(
-                    self.final_data_path, class_id, self.num_generations, id, local_rank
+                    self.final_images_path,
+                    class_id,
+                    self.num_generations,
+                    id,
+                    local_rank,
                 )
             else:
                 place_to_store = "{}/img_s{:03d}_{:05d}_id{:03d}_gpu_{}_2.jpg".format(
-                    self.final_data_path, class_id, self.num_generations, id, local_rank
+                    self.final_images_path,
+                    class_id,
+                    self.num_generations,
+                    id,
+                    local_rank,
                 )
 
             image_np = images[id].data.cpu().numpy().transpose((1, 2, 0))
@@ -502,8 +589,7 @@ class ViTDeepInversionClass(object):
 
     def generate_batch(self, targets=None):
         # Put to eval mode
-        net_teacher = self.net_teacher
-        net_verifier = self.net_verifier
+        vit_teacher = self.vit_teacher
 
         use_fp16 = self.use_fp16
 
@@ -514,7 +600,6 @@ class ViTDeepInversionClass(object):
 
         self.get_images(targets=targets)
 
-        net_teacher.eval()
-        net_verifier.eval()
+        vit_teacher.eval()
 
         self.num_generations += 1

@@ -28,7 +28,7 @@ import torch.cuda.amp as amp
 import os
 import torchvision.models as models
 
-random.seed(0)
+random.seed(1)
 
 
 def validate(input, target, model, use_fp16):
@@ -63,12 +63,12 @@ def validate(input, target, model, use_fp16):
             output = model(input)
             prec1, prec5 = accuracy(output.data, target, topk=(1, 5))
 
-    print("Verifier accuracy: ", prec1.item())
+    print("Verifier accuracy (top 1): ", prec1.item())
+    print("Verifier accuracy (top 5): ", prec5.item())
 
 
 # Command to run the script:
-# python run.py --bs=32 --do_flip --r_feature_scale=0.01 --kl_loss_scale=0.1 --setting_id=0 --lr 0.25
-# (OPTIONAL) --l2 0.00001 --tv_l1 0.0 --tv_l2 0.0001 --main_loss_multiplier 1.0 --kl_loss_scale 0.1 --first_ln_multiplier 10.0 --output_dir="vit_inversion_output" --store_best_images
+# python run.py --do_flip --r_feature_scale=0.0 --image_prior_scale=0.0 --n_iterations=5000 --lr=0.25 --l2_scale=0.0 --tv_l1_scale=0.0 --tv_l2_scale=0.0 --main_loss_scale=1.0 --image_prior_scale=0.0 --store_best_images
 
 
 def run(args):
@@ -77,7 +77,7 @@ def run(args):
     use_fp16 = args.fp16
 
     bs = args.bs
-    setting_id = args.setting_id
+    n_iterations = args.n_iterations
     jitter = args.jitter
 
     store_dir = args.store_dir
@@ -91,69 +91,83 @@ def run(args):
     parameters["store_best_images"] = args.store_best_images
 
     coefficients = dict()
+    coefficients["vit_feature_loss"] = args.vit_feature_loss
     coefficients["lr"] = args.lr
-    coefficients["r_feature_scale"] = args.r_feature_scale
-    coefficients["first_ln_multiplier"] = args.first_ln_multiplier
+    coefficients["warmup_length"] = args.warmup_length
+    coefficients["first_bn_multiplier"] = args.first_bn_multiplier
     coefficients["tv_l1_scale"] = args.tv_l1_scale
     coefficients["tv_l2_scale"] = args.tv_l2_scale
     coefficients["l2_scale"] = args.l2_scale
-    coefficients["kl_loss_scale"] = args.kl_loss_scale
-    coefficients["main_loss_multiplier"] = args.main_loss_multiplier
+    coefficients["patch_prior_scale"] = args.patch_prior_scale
+    coefficients["extra_prior_scale"] = args.extra_prior_scale
+    coefficients["image_prior_scale"] = args.image_prior_scale
+    coefficients["r_feature_scale"] = args.r_feature_scale
+    coefficients["main_loss_scale"] = args.main_loss_scale
 
     torch.manual_seed(local_rank)
     device = torch.device(
         "cuda" if torch.cuda.is_available() and not no_cuda else "cpu"
     )
+    torch.cuda.set_device(local_rank)
 
     print("Loading model for inversion...")
 
     ### load models
     # ! Load from torchvision directly
-    net = torchvision.models.vit_b_16(weights="IMAGENET1K_V1").to(device)
+    vit = torchvision.models.vit_b_16(weights="IMAGENET1K_V1").to(device)
 
     if use_fp16:
-        net.half()
+        vit.half()
 
-    for module in net.modules():
+    for module in vit.modules():
         if isinstance(module, torch.nn.LayerNorm):
             module.float()
 
-    net.eval()
+    vit.eval()
 
     # reserved to compute test accuracy on generated images by different networks
+    net_guide = None
+
+    print("Loading guiding CNN...")
+
+    # Load ResNet-50
+    net_guide = torchvision.models.resnet50(weights="IMAGENET1K_V1").to(device)
+
+    if use_fp16:
+        # Convert model to FP16
+        net_guide.half()
+
+        # Ensure BatchNorm stays in FP32 for stability
+        for module in net_guide.modules():
+            if isinstance(module, torch.nn.BatchNorm2d):
+                module.float()
+
+    # Set model to evaluation mode
+    net_guide.eval()
+
     net_verifier = None
-    if local_rank == 0:
-        print("Loading verifier...")
+    print("Loading verifier...", args.verifier_arch)
+    net_verifier = models.__dict__[args.verifier_arch](pretrained=True).to(device)
+    net_verifier.eval()
 
-        # Load ResNet-50
-        net_verifier = torchvision.models.resnet50(weights="IMAGENET1K_V1").to(device)
+    if use_fp16:
+        net_verifier = net_verifier.half()
 
-        if use_fp16:
-            # Convert model to FP16
-            net_verifier.half()
-
-            # Ensure BatchNorm stays in FP32 for stability
-            for module in net_verifier.modules():
-                if isinstance(module, torch.nn.BatchNorm2d):
-                    module.float()
-
-        # Set model to evaluation mode
-        net_verifier.eval()
-
-    from deepinversion_vit import ViTDeepInversionClass
+    # from deepinversion_vit import ViTDeepInversionClass
+    from deepinversion_vit_combined import ViTDeepInversionClass
 
     criterion = nn.CrossEntropyLoss()
 
     ViTDeepInversionEngine = ViTDeepInversionClass(
-        net_teacher=net,
-        net_verifier=net_verifier,
-        path=store_dir,
-        parameters=parameters,
-        setting_id=setting_id,
+        vit_teacher=vit,
+        net_guide=net_guide,
+        store_dir=store_dir,
+        n_iterations=n_iterations,
         bs=bs,
         use_fp16=use_fp16,
         jitter=jitter,
         criterion=criterion,
+        parameters=parameters,
         coefficients=coefficients,
         network_output_function=lambda x: x,
         hook_for_display=lambda x, y: validate(x, y, net_verifier, use_fp16),
@@ -167,17 +181,14 @@ def main():
         "--local_rank",
         "--rank",
         type=int,
-        default=0,
+        default=1,
         help="Rank of the current process.",
     )
     parser.add_argument("--no-cuda", action="store_true")
+    parser.add_argument("--bs", default=32, type=int, help="batch size")
     parser.add_argument(
-        "--setting_id",
-        default=0,
-        type=int,
-        help="settings for optimization: 0 - multi resolution, 1 - 2k iterations, 2 - 20k iterations",
+        "--n_iterations", default=3000, type=int, help="Number of iterations"
     )
-    parser.add_argument("--bs", default=64, type=int, help="batch size")
     parser.add_argument("--jitter", default=30, type=int, help="input jitter")
     parser.add_argument("--fp16", action="store_true", help="use FP16 for optimization")
     parser.add_argument(
@@ -200,48 +211,79 @@ def main():
         help="save best images as separate files",
     )
 
+    parser.add_argument(
+        "--verifier_arch",
+        type=str,
+        default="mobilenet_v2",
+        help="arch name from torchvision models to act as a verifier",
+    )
+
     # Coefficients for optimization
     parser.add_argument(
-        "--lr", type=float, default=0.05, help="learning rate for optimization"
+        "--vit_feature_loss",
+        type=str,
+        default="l2",
+        help="Use L2-norm or KL div for image prior",
+    )
+    parser.add_argument(
+        "--lr", type=float, default=0.25, help="learning rate for optimization"
+    )
+    parser.add_argument(
+        "--warmup_length",
+        type=float,
+        default=100,
+        help="warmup length for cosine scheduler learning rate",
+    )
+    parser.add_argument(
+        "--first_bn_multiplier",
+        type=float,
+        default=10.0,
+        help="additional multiplier on first bn layer of R_feature",
+    )
+    parser.add_argument(
+        "--main_loss_scale",
+        type=float,
+        default=0.05,
+        help="coefficient for the main loss in optimization",
     )
     parser.add_argument(
         "--r_feature_scale",
         type=float,
-        default=0.05,
+        default=0.005,
         help="coefficient for feature distribution regularization",
     )
     parser.add_argument(
-        "--first_ln_multiplier",
+        "--image_prior_scale",
         type=float,
-        default=10.0,
-        help="additional multiplier on first layer of R_feature",
+        default=0.0001,
+        help="Coefficient for KL Loss",
+    )
+    parser.add_argument(
+        "--patch_prior_scale",
+        type=float,
+        default=0.00001,
+        help="coefficient for the patch prior loss",
+    )
+    parser.add_argument(
+        "--extra_prior_scale",
+        type=float,
+        default=1.0,
+        help="coefficient for the patch prior loss",
     )
     parser.add_argument(
         "--tv_l1_scale",
         type=float,
-        default=0.005,
+        default=0.0001,
         help="coefficient for total variation L1 loss",
     )
     parser.add_argument(
         "--tv_l2_scale",
         type=float,
-        default=0.05,
+        default=0.000001,
         help="coefficient for total variation L2 loss",
     )
     parser.add_argument(
-        "--l2_scale", type=float, default=0.001, help="l2 loss on the image"
-    )
-    parser.add_argument(
-        "--kl_loss_scale",
-        type=float,
-        default=0.15,
-        help="Coefficient for KL Loss",
-    )
-    parser.add_argument(
-        "--main_loss_multiplier",
-        type=float,
-        default=1.0,
-        help="coefficient for the main loss in optimization",
+        "--l2_scale", type=float, default=0.000001, help="l2 loss on the image"
     )
     args = parser.parse_args()
     print(args)
